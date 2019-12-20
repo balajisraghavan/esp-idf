@@ -170,7 +170,7 @@ TEST_CASE("mbedtls SHA self-tests multithreaded", "[mbedtls]")
     xTaskCreate(tskRunSHASelftests, "SHASelftests1", SHA_TASK_STACK_SIZE, NULL, 3, NULL);
     xTaskCreate(tskRunSHASelftests, "SHASelftests2", SHA_TASK_STACK_SIZE, NULL, 3, NULL);
 
-    const int TIMEOUT_MS = 20000;
+    const int TIMEOUT_MS = 40000;
 
     for(int i = 0; i < 2; i++) {
         if(!xSemaphoreTake(done_sem, TIMEOUT_MS/portTICK_PERIOD_MS)) {
@@ -276,7 +276,8 @@ static void tskFinaliseSha(void *v_param)
     vTaskDelete(NULL);
 }
 
-TEST_CASE("mbedtls SHA session passed between tasks" , "[mbedtls]")
+// No concurrent SHA sessions in esp32s2, only has one engine
+TEST_CASE_ESP32("mbedtls SHA session passed between tasks" , "[mbedtls]")
 {
     finalise_sha_param_t param = { 0 };
 

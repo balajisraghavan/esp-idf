@@ -4,24 +4,26 @@
 #include <sys/time.h>
 #include <sys/param.h>
 #include "unity.h"
+#include "soc/frc_timer_reg.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "test_utils.h"
-#include "../esp_timer_impl.h"
+#include "esp_private/esp_timer_impl.h"
+#include "esp_freertos_hooks.h"
 
 #ifdef CONFIG_ESP_TIMER_PROFILING
 #define WITH_PROFILING 1
 #endif
 
-extern uint32_t esp_timer_impl_get_overflow_val();
+extern uint32_t esp_timer_impl_get_overflow_val(void);
 extern void esp_timer_impl_set_overflow_val(uint32_t overflow_val);
 
 static uint32_t s_old_overflow_val;
 
-static void setup_overflow()
+static void setup_overflow(void)
 {
     s_old_overflow_val = esp_timer_impl_get_overflow_val();
     /* Overflow every 0.1 sec.
@@ -31,7 +33,7 @@ static void setup_overflow()
     esp_timer_impl_set_overflow_val(8000000);
 }
 
-static void teardown_overflow()
+static void teardown_overflow(void)
 {
     esp_timer_impl_set_overflow_val(s_old_overflow_val);
 }
@@ -409,7 +411,7 @@ TEST_CASE("esp_timer_get_time call takes less than 1us", "[esp_timer]")
     TEST_PERFORMANCE_LESS_THAN(ESP_TIMER_GET_TIME_PER_CALL, "%dns", ns_per_call);
 }
 
-static int64_t IRAM_ATTR __attribute__((noinline)) get_clock_diff()
+static int64_t IRAM_ATTR __attribute__((noinline)) get_clock_diff(void)
 {
     uint64_t hs_time = esp_timer_get_time();
     uint64_t ref_time = ref_clock_get();
@@ -536,6 +538,61 @@ TEST_CASE("Can delete timer from callback", "[esp_timer]")
     vSemaphoreDelete(args.notify_from_timer_cb);
 }
 
+
+typedef struct {
+    SemaphoreHandle_t delete_start;
+    SemaphoreHandle_t delete_done;
+    SemaphoreHandle_t test_done;
+    esp_timer_handle_t timer;
+} timer_delete_test_args_t;
+
+static void timer_delete_task(void* arg)
+{
+    timer_delete_test_args_t* args = (timer_delete_test_args_t*) arg;
+    xSemaphoreTake(args->delete_start, portMAX_DELAY);
+    printf("Deleting the timer\n");
+    esp_timer_delete(args->timer);
+    printf("Timer deleted\n");
+    xSemaphoreGive(args->delete_done);
+    vTaskDelete(NULL);
+}
+
+static void timer_delete_test_callback(void* arg)
+{
+    timer_delete_test_args_t* args = (timer_delete_test_args_t*) arg;
+    printf("Timer callback called\n");
+    xSemaphoreGive(args->delete_start);
+    xSemaphoreTake(args->delete_done, portMAX_DELAY);
+    printf("Callback complete\n");
+    xSemaphoreGive(args->test_done);
+}
+
+TEST_CASE("Can delete timer from a separate task, triggered from callback", "[esp_timer]")
+{
+    timer_delete_test_args_t args = {
+        .delete_start = xSemaphoreCreateBinary(),
+        .delete_done = xSemaphoreCreateBinary(),
+        .test_done = xSemaphoreCreateBinary(),
+    };
+
+    esp_timer_create_args_t timer_args = {
+            .callback = &timer_delete_test_callback,
+            .arg = &args
+    };
+    esp_timer_handle_t timer;
+    TEST_ESP_OK(esp_timer_create(&timer_args, &timer));
+    args.timer = timer;
+
+    xTaskCreate(timer_delete_task, "deleter", 4096, &args, 5, NULL);
+
+    esp_timer_start_once(timer, 100);
+    TEST_ASSERT(xSemaphoreTake(args.test_done, pdMS_TO_TICKS(1000)));
+
+    vSemaphoreDelete(args.delete_done);
+    vSemaphoreDelete(args.delete_start);
+    vSemaphoreDelete(args.test_done);
+}
+
 TEST_CASE("esp_timer_impl_advance moves time base correctly", "[esp_timer]")
 {
     ref_clock_init();
@@ -593,4 +650,189 @@ TEST_CASE("after esp_timer_impl_advance, timers run when expected", "[esp_timer]
     TEST_ASSERT(state.cb_time > t_start);
 
     ref_clock_deinit();
+}
+
+static esp_timer_handle_t timer1;
+static SemaphoreHandle_t sem;
+static void IRAM_ATTR test_tick_hook(void)
+{
+    static int i;
+    const int iterations = 16;
+
+    if (++i <= iterations) {
+        if (i & 0x1) {
+            TEST_ESP_OK(esp_timer_start_once(timer1, 5000));
+        } else {
+            TEST_ESP_OK(esp_timer_stop(timer1));
+        }
+    } else {
+        xSemaphoreGiveFromISR(sem, 0);
+    }
+}
+
+TEST_CASE("Can start/stop timer from ISR context", "[esp_timer]")
+{
+    void timer_func(void* arg)
+    {
+        printf("timer cb\n");
+    }
+
+    esp_timer_create_args_t create_args = {
+        .callback = &timer_func,
+    };
+    TEST_ESP_OK(esp_timer_create(&create_args, &timer1));
+    sem = xSemaphoreCreateBinary();
+    esp_register_freertos_tick_hook(test_tick_hook);
+    TEST_ASSERT(xSemaphoreTake(sem, portMAX_DELAY));
+    esp_deregister_freertos_tick_hook(test_tick_hook);
+    TEST_ESP_OK( esp_timer_delete(timer1) );
+    vSemaphoreDelete(sem);
+}
+
+#if !defined(CONFIG_FREERTOS_UNICORE) && defined(CONFIG_ESP32_DPORT_WORKAROUND)
+
+#include "soc/dport_reg.h"
+#include "soc/frc_timer_reg.h"
+#include "esp_ipc.h"
+static bool task_stop;
+static bool time_jumped;
+
+static void task_check_time(void *p)
+{
+    int64_t  t1 = 0, t2 = 0;
+    while (task_stop == false) {
+
+        t1 = t2;
+        t2 = esp_timer_get_time();
+        if (t1 > t2) {
+            int64_t shift_us = t2 - t1;
+            time_jumped = true;
+            printf("System clock jumps back: %lli us\n", shift_us);
+        }
+
+        vTaskDelay(1);
+    }
+    vTaskDelete(NULL);
+}
+
+static void timer_callback(void* arg)
+{
+
+}
+
+static void dport_task(void *pvParameters)
+{
+    while (task_stop == false) {
+        DPORT_STALL_OTHER_CPU_START();
+        ets_delay_us(3);
+        DPORT_STALL_OTHER_CPU_END();
+    }
+    vTaskDelete(NULL);
+}
+
+TEST_CASE("esp_timer_impl_set_alarm does not set an alarm below the current time", "[esp_timer][timeout=62]")
+{
+    const int max_timers = 2;
+    time_jumped = false;
+    task_stop   = false;
+
+    xTaskCreatePinnedToCore(task_check_time, "task_check_time", 4096, NULL, 5, NULL, 0);
+    // dport_task is used here to interrupt the esp_timer_impl_set_alarm function.
+    // To interrupt it we can use an interrupt with 4 or 5 levels which will run on CPU0.
+    // Instead, an interrupt we use the dport workaround which has 4 interrupt level for stall CPU0.
+    xTaskCreatePinnedToCore(dport_task, "dport_task", 4096, NULL, 5, NULL, 1);
+
+    const esp_timer_create_args_t periodic_timer_args = {
+        .callback = &timer_callback,
+    };
+
+    esp_timer_handle_t periodic_timer[max_timers];
+    printf("timers created\n");
+
+    esp_timer_create(&periodic_timer_args, &periodic_timer[0]);
+    esp_timer_start_periodic(periodic_timer[0], 9000);
+
+    esp_timer_create(&periodic_timer_args, &periodic_timer[1]);
+    esp_timer_start_periodic(periodic_timer[1], 9000);
+
+    vTaskDelay(60 * 1000 / portTICK_PERIOD_MS);
+    task_stop = true;
+
+    esp_timer_stop(periodic_timer[0]);
+    esp_timer_delete(periodic_timer[0]);
+    esp_timer_stop(periodic_timer[1]);
+    esp_timer_delete(periodic_timer[1]);
+    printf("timers deleted\n");
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    TEST_ASSERT(time_jumped == false);
+}
+
+
+static esp_timer_handle_t oneshot_timer;
+
+static void oneshot_timer_callback(void* arg)
+{
+    esp_timer_start_once(oneshot_timer, 5000);
+}
+
+static const esp_timer_create_args_t oneshot_timer_args = {
+    .callback = &oneshot_timer_callback,
+};
+
+TEST_CASE("esp_timer_impl_set_alarm and using start_once do not lead that the System time jumps back", "[esp_timer][timeout=62]")
+{
+    time_jumped = false;
+    task_stop   = false;
+
+    xTaskCreatePinnedToCore(task_check_time, "task_check_time", 4096, NULL, 5, NULL, 0);
+    // dport_task is used here to interrupt the esp_timer_impl_set_alarm function.
+    // To interrupt it we can use an interrupt with 4 or 5 levels which will run on CPU0.
+    // Instead, an interrupt we use the dport workaround which has 4 interrupt level for stall CPU0.
+    xTaskCreatePinnedToCore(dport_task, "dport_task", 4096, NULL, 5, NULL, 1);
+
+    const esp_timer_create_args_t periodic_timer_args = {
+        .callback = &timer_callback,
+    };
+
+    esp_timer_handle_t periodic_timer;
+
+    esp_timer_create(&periodic_timer_args, &periodic_timer);
+    esp_timer_start_periodic(periodic_timer, 5000);
+
+    esp_timer_create(&oneshot_timer_args, &oneshot_timer);
+    esp_timer_start_once(oneshot_timer, 9990);
+    printf("timers created\n");
+
+    vTaskDelay(60 * 1000 / portTICK_PERIOD_MS);
+    task_stop = true;
+
+    esp_timer_stop(oneshot_timer);
+    esp_timer_delete(oneshot_timer);
+    printf("timers deleted\n");
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    TEST_ASSERT(time_jumped == false);
+}
+
+#endif // !defined(CONFIG_FREERTOS_UNICORE) && defined(CONFIG_ESP32_DPORT_WORKAROUND)
+
+TEST_CASE("Test case when esp_timer_impl_set_alarm needs set timer < now_time", "[esp_timer]")
+{
+    REG_WRITE(FRC_TIMER_LOAD_REG(1), 0);
+    esp_timer_impl_advance(50331648); // 0xefffffff/80 = 50331647
+
+    ets_delay_us(2);
+
+    portDISABLE_INTERRUPTS();
+    esp_timer_impl_set_alarm(50331647);
+    uint32_t alarm_reg = REG_READ(FRC_TIMER_ALARM_REG(1));
+    uint32_t count_reg = REG_READ(FRC_TIMER_COUNT_REG(1));
+    portENABLE_INTERRUPTS();
+
+    const uint32_t offset = 80 * 2; // s_timer_ticks_per_us
+    printf("alarm_reg = 0x%x, count_reg 0x%x\n", alarm_reg, count_reg);
+    TEST_ASSERT(alarm_reg <= (count_reg + offset));
 }

@@ -142,7 +142,20 @@ import http.client
 import sys
 import string
 import random
-import Utility
+
+
+try:
+    import Utility
+except ImportError:
+    import os
+
+    # This environment variable is expected on the host machine
+    # > export TEST_FW_PATH=~/esp/esp-idf/tools/tiny-test-fw
+    test_fw_path = os.getenv("TEST_FW_PATH")
+    if test_fw_path and test_fw_path not in sys.path:
+        sys.path.insert(0, test_fw_path)
+
+    import Utility
 
 _verbose_ = False
 
@@ -427,6 +440,34 @@ def get_echo(dut, port):
     return True
 
 
+def get_test_headers(dut, port):
+    # GET /test_header returns data of Header2'
+    Utility.console_log("[test] GET /test_header =>", end=' ')
+    conn = http.client.HTTPConnection(dut, int(port), timeout=15)
+    custom_header = {"Header1": "Value1", "Header3": "Value3"}
+    header2_values = ["", "  ", "Value2", "   Value2", "Value2  ", "  Value2  "]
+    for val in header2_values:
+        custom_header["Header2"] = val
+        conn.request("GET", "/test_header", headers=custom_header)
+        resp = conn.getresponse()
+        if not test_val("status_code", 200, resp.status):
+            conn.close()
+            return False
+        hdr_val_start_idx = val.find("Value2")
+        if hdr_val_start_idx == -1:
+            if not test_val("header: Header2", "", resp.read().decode()):
+                conn.close()
+                return False
+        else:
+            if not test_val("header: Header2", val[hdr_val_start_idx:], resp.read().decode()):
+                conn.close()
+                return False
+        resp.read()
+    Utility.console_log("Success")
+    conn.close()
+    return True
+
+
 def get_hello_type(dut, port):
     # GET /hello/type_html returns text/html as Content-Type'
     Utility.console_log("[test] GET /hello/type_html has Content-Type of text/html =>", end=' ')
@@ -633,6 +674,105 @@ def packet_size_limit_test(dut, port, test_size):
         return True
     Utility.console_log("Failed")
     return False
+
+
+def arbitrary_termination_test(dut, port):
+    Utility.console_log("[test] Arbitrary termination test =>", end=' ')
+    cases = [
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\r\nCustom: SomeValue\r\n\r\n",
+            "code": "200",
+            "header": "SomeValue"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\nHost: " + dut + "\r\nCustom: SomeValue\r\n\r\n",
+            "code": "200",
+            "header": "SomeValue"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\nCustom: SomeValue\r\n\r\n",
+            "code": "200",
+            "header": "SomeValue"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\r\nCustom: SomeValue\n\r\n",
+            "code": "200",
+            "header": "SomeValue"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\r\nCustom: SomeValue\r\n\n",
+            "code": "200",
+            "header": "SomeValue"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\nHost: " + dut + "\nCustom: SomeValue\n\n",
+            "code": "200",
+            "header": "SomeValue"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\r\nContent-Length: 5\n\r\nABCDE",
+            "code": "200",
+            "body": "ABCDE"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\r\nContent-Length: 5\r\n\nABCDE",
+            "code": "200",
+            "body": "ABCDE"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\r\nContent-Length: 5\n\nABCDE",
+            "code": "200",
+            "body": "ABCDE"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\r\nContent-Length: 5\n\n\rABCD",
+            "code": "200",
+            "body": "\rABCD"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\r\r\nCustom: SomeValue\r\r\n\r\r\n",
+            "code": "400"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\r\nHost: " + dut + "\r\n\r\n",
+            "code": "400"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\n\rHost: " + dut + "\r\n\r\n",
+            "code": "400"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\rCustom: SomeValue\r\n",
+            "code": "400"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\r\nCustom: Some\rValue\r\n",
+            "code": "400"
+        },
+        {
+            "request": "POST /echo HTTP/1.1\r\nHost: " + dut + "\r\nCustom- SomeValue\r\n\r\n",
+            "code": "400"
+        }
+    ]
+    for case in cases:
+        s = Session(dut, port)
+        s.client.sendall((case['request']).encode())
+        resp_hdrs = s.read_resp_hdrs()
+        resp_body = s.read_resp_data()
+        s.close()
+        if not test_val("Response Code", case["code"], s.status):
+            return False
+        if "header" in case.keys():
+            resp_hdr_val = None
+            if "Custom" in resp_hdrs.keys():
+                resp_hdr_val = resp_hdrs["Custom"]
+            if not test_val("Response Header", case["header"], resp_hdr_val):
+                return False
+        if "body" in case.keys():
+            if not test_val("Response Body", case["body"], resp_body):
+                return False
+    Utility.console_log("Success")
+    return True
 
 
 def code_500_server_error_test(dut, port):
@@ -867,6 +1007,7 @@ if __name__ == '__main__':
     get_hello_type(dut, port)
     get_hello_status(dut, port)
     get_false_uri(dut, port)
+    get_test_headers(dut, port)
 
     Utility.console_log("### Error code tests")
     code_500_server_error_test(dut, port)
@@ -890,6 +1031,7 @@ if __name__ == '__main__':
     spillover_session(dut, port, max_sessions)
     recv_timeout_test(dut, port)
     packet_size_limit_test(dut, port, 50 * 1024)
+    arbitrary_termination_test(dut, port)
     get_hello(dut, port)
 
     sys.exit()

@@ -155,9 +155,10 @@ size_t httpd_unrecv(struct httpd_req *r, const char *buf, size_t buf_len)
     /* Truncate if external buf_len is greater than pending_data buffer size */
     ra->sd->pending_len = MIN(sizeof(ra->sd->pending_data), buf_len);
 
-    /* Copy data into internal pending_data buffer */
+    /* Copy data into internal pending_data buffer with the exact offset
+     * such that it is right aligned inside the buffer */
     size_t offset = sizeof(ra->sd->pending_data) - ra->sd->pending_len;
-    memcpy(ra->sd->pending_data + offset, buf, buf_len);
+    memcpy(ra->sd->pending_data + offset, buf, ra->sd->pending_len);
     ESP_LOGD(TAG, LOG_FMT("length = %d"), ra->sd->pending_len);
     return ra->sd->pending_len;
 }
@@ -552,16 +553,9 @@ int httpd_req_to_sockfd(httpd_req_t *r)
 static int httpd_sock_err(const char *ctx, int sockfd)
 {
     int errval;
-    int sock_err;
-    size_t sock_err_len = sizeof(sock_err);
+    ESP_LOGW(TAG, LOG_FMT("error in %s : %d"), ctx, errno);
 
-    if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &sock_err, &sock_err_len) < 0) {
-        ESP_LOGE(TAG, LOG_FMT("error calling getsockopt : %d"), errno);
-        return HTTPD_SOCK_ERR_FAIL;
-    }
-    ESP_LOGW(TAG, LOG_FMT("error in %s : %d"), ctx, sock_err);
-
-    switch(sock_err) {
+    switch(errno) {
     case EAGAIN:
     case EINTR:
         errval = HTTPD_SOCK_ERR_TIMEOUT;

@@ -1,4 +1,4 @@
-// Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
+// Copyright 2015-2019 Espressif Systems (Shanghai) PTE LTD
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,10 @@
 #ifndef ESP_CORE_DUMP_H_
 #define ESP_CORE_DUMP_H_
 
+#include <stddef.h>
+#include "esp_err.h"
+#include "freertos/xtensa_context.h"
+
 /**************************************************************************************/
 /******************************** EXCEPTION MODE API **********************************/
 /**************************************************************************************/
@@ -23,7 +27,7 @@
  *
  * @note  Should be called at system startup.
  */
-void esp_core_dump_init();
+void esp_core_dump_init(void);
 
 /**
  * @brief  Saves core dump to flash.
@@ -54,7 +58,7 @@ void esp_core_dump_init();
  * 4) Task's stack is placed after TCB data. Size is (STACK_END - STACK_TOP) bytes.
  * 5) CRC is placed at the end of the data.
  */
-void esp_core_dump_to_flash();
+void esp_core_dump_to_flash(XtExcFrame *frame);
 
 /**
  * @brief  Print base64-encoded core dump to UART.
@@ -64,8 +68,7 @@ void esp_core_dump_to_flash();
  * 2) Since CRC is omitted TOTAL_LEN does not include its size.
  * 3) Printed base64 data are surrounded with special messages to help user recognize the start and end of actual data.
  */
-void esp_core_dump_to_uart();
-
+void esp_core_dump_to_uart(XtExcFrame *frame);
 
 /**************************************************************************************/
 /*********************************** USER MODE API ************************************/
